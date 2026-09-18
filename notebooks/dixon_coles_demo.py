@@ -14,18 +14,13 @@
 import numpy as np
 import pandas as pd
 
+from betting_model.devig import devig
 from betting_model.dixon_coles import fit_dixon_coles
 from betting_model.markets import asian_handicap, match_odds, over_under
 
 pd.set_option("display.width", 120)
 
 df = pd.read_parquet("../data/processed/matches.parquet")
-
-
-def devig(*odds: float) -> tuple[float, ...]:
-    implied = [1 / o for o in odds]
-    total = sum(implied)
-    return tuple(p / total for p in implied)
 
 
 # %% [markdown]

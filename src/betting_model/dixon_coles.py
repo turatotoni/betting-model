@@ -22,12 +22,20 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.stats import poisson
 
-# Both of these are untuned placeholders, not results of any validation --
-# tuning them properly is a job for the walk-forward backtest (later phase),
-# which can score different (xi, lookback_days) pairs against calibration/
-# CLV rather than eyeballing it.
+# Picked by a walk-forward grid search over xi in {0.0005, 0.0018, 0.004}
+# and lookback_days in {730, 1460, 2920} across all 6 leagues, 2005-2026,
+# scored on Over/Under 2.5 and Asian Handicap Brier score (see
+# backtest.py / calibration.py). The grid's spread was small (Brier_ou
+# 0.2473-0.2510, Brier_ah 0.2497-0.2518) -- these values win or nearly
+# win on all three markets (O/U, AH, 1X2) but do NOT fix the model's
+# deeper overconfidence at the probability extremes on O/U and AH (see
+# reliability_table output); that looks structural -- point-estimate MLE
+# doesn't propagate team-strength uncertainty, and it compounds for
+# sum-of-two-teams markets (goals, handicap margin) in a way it doesn't
+# for the win/draw/away split. A post-hoc calibration layer is the next
+# thing to try for that, not further (xi, lookback_days) tuning.
 DEFAULT_XI = 0.0018  # time-decay rate per day (~385-day half-life)
-DEFAULT_LOOKBACK_DAYS = 4 * 365
+DEFAULT_LOOKBACK_DAYS = 8 * 365
 
 
 @dataclass
@@ -119,29 +127,67 @@ def fit_dixon_coles(
         home_adv, rho = theta[2 * n - 1], theta[2 * n]
         return attack, defense, home_adv, rho
 
-    def neg_log_likelihood(theta: np.ndarray) -> float:
+    low_score = (home_goals <= 1) & (away_goals <= 1)
+    ls_hg, ls_ag = home_goals[low_score], away_goals[low_score]
+    is00, is01 = (ls_hg == 0) & (ls_ag == 0), (ls_hg == 0) & (ls_ag == 1)
+    is10, is11 = (ls_hg == 1) & (ls_ag == 0), (ls_hg == 1) & (ls_ag == 1)
+
+    def neg_log_likelihood_and_grad(theta: np.ndarray) -> tuple[float, np.ndarray]:
         attack, defense, home_adv, rho = unpack(theta)
-        lam = np.exp(home_adv + attack[home_idx] - defense[away_idx])
-        mu = np.exp(attack[away_idx] - defense[home_idx])
+        z_lam = home_adv + attack[home_idx] - defense[away_idx]
+        z_mu = attack[away_idx] - defense[home_idx]
+        lam, mu = np.exp(z_lam), np.exp(z_mu)
 
         ll = poisson.logpmf(home_goals, lam) + poisson.logpmf(away_goals, mu)
 
-        low_score = (home_goals <= 1) & (away_goals <= 1)
-        if low_score.any():
-            tau_vals = np.array([
-                _tau(int(hg), int(ag), l, m, rho)
-                for hg, ag, l, m in zip(
-                    home_goals[low_score], away_goals[low_score], lam[low_score], mu[low_score]
-                )
-            ])
-            ll[low_score] += np.log(np.clip(tau_vals, 1e-10, None))
+        # d(log Poisson(k; lam))/d(z_lam) = k - lam (since lam = exp(z_lam));
+        # same shape for mu/z_mu. rho has no gradient contribution outside
+        # the four low-score cells below.
+        d_zlam = home_goals - lam
+        d_zmu = away_goals - mu
+        d_rho = np.zeros_like(lam)
 
-        return -np.sum(weights * ll)
+        if low_score.any():
+            l, m = lam[low_score], mu[low_score]
+            tau_vals = np.ones_like(l)
+            tau_vals[is00] = 1 - l[is00] * m[is00] * rho
+            tau_vals[is01] = 1 + l[is01] * rho
+            tau_vals[is10] = 1 + m[is10] * rho
+            tau_vals[is11] = 1 - rho
+            tau_vals = np.clip(tau_vals, 1e-10, None)
+            ll[low_score] += np.log(tau_vals)
+
+            # d(tau)/d(lam), d(tau)/d(mu), d(tau)/d(rho) per case, chained
+            # through d(lam)/d(z_lam) = lam (and same for mu) to get
+            # d(log tau)/d(z_lam) = [d(tau)/d(lam) * lam] / tau, etc.
+            dtau_dlam, dtau_dmu, dtau_drho = np.zeros_like(l), np.zeros_like(l), np.zeros_like(l)
+            dtau_dlam[is00], dtau_dmu[is00] = -m[is00] * rho, -l[is00] * rho
+            dtau_drho[is00] = -l[is00] * m[is00]
+            dtau_dlam[is01], dtau_drho[is01] = rho, l[is01]
+            dtau_dmu[is10], dtau_drho[is10] = rho, m[is10]
+            dtau_drho[is11] = -1.0
+
+            d_zlam[low_score] += dtau_dlam * l / tau_vals
+            d_zmu[low_score] += dtau_dmu * m / tau_vals
+            d_rho[low_score] += dtau_drho / tau_vals
+
+        nll = -np.sum(weights * ll)
+
+        w_zlam, w_zmu, w_rho = weights * d_zlam, weights * d_zmu, weights * d_rho
+        grad_attack, grad_defense = np.zeros(n), np.zeros(n)
+        np.add.at(grad_attack, home_idx, -w_zlam)
+        np.add.at(grad_attack, away_idx, -w_zmu)
+        np.add.at(grad_defense, away_idx, w_zlam)
+        np.add.at(grad_defense, home_idx, w_zmu)
+        grad_home_adv, grad_rho = -np.sum(w_zlam), -np.sum(w_rho)
+
+        grad = np.concatenate([grad_attack[1:], grad_defense, [grad_home_adv], [grad_rho]])
+        return nll, grad
 
     x0 = np.concatenate([np.zeros(n - 1), np.zeros(n), [0.2], [0.0]])
     bounds = [(-3.0, 3.0)] * (n - 1) + [(-3.0, 3.0)] * n + [(-2.0, 2.0), (-1.0, 1.0)]
 
-    result = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds)
+    result = minimize(neg_log_likelihood_and_grad, x0, method="L-BFGS-B", jac=True, bounds=bounds)
     attack, defense, home_adv, rho = unpack(result.x)
 
     return DixonColesModel(
